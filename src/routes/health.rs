@@ -1,6 +1,6 @@
 //! `GET /api/health` — dice se il servizio è vivo *e* se il DB risponde.
 
-use axum::Json;
+use crate::extract::Json;
 use axum::extract::State;
 use serde::Serialize;
 

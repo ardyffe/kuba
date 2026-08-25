@@ -1,6 +1,6 @@
 //! Le rotte delle fatture: upload, lista, dettaglio, download del PDF.
 
-use axum::Json;
+use crate::extract::Json;
 use axum::body::Bytes;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};

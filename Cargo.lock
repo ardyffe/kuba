@@ -919,6 +919,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hex",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2146,6 +2147,7 @@ dependencies = [
  "cfg-if",
  "once_cell",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

@@ -2,6 +2,7 @@
 
 mod health;
 mod invoices;
+mod products;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -34,6 +35,13 @@ pub fn router(state: AppState) -> Router {
         // precedenti erano `:id`).
         .route("/api/invoices/{id}", get(invoices::detail))
         .route("/api/invoices/{id}/file", get(invoices::download))
+        .route("/api/products", get(products::list))
+        .route(
+            "/api/products/{id}",
+            get(products::detail)
+                .put(products::update)
+                .delete(products::delete),
+        )
         // Il limite di dimensione vale per tutte le rotte qui sopra.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         // Un layer è un middleware: qui logghiamo metodo, path, status e durata
