@@ -53,7 +53,7 @@ pub async fn list(
     let products = sqlx::query_as!(
         ProductSummary,
         r#"
-        SELECT id, ean, sku, title, brand, price, stock,
+        SELECT id, ean, sku, title, brand, price,
                status as "status: ProductStatus", updated_at
         FROM products
         WHERE (($1::product_status IS NULL AND status <> 'deleted') OR status = $1)
@@ -84,7 +84,7 @@ pub async fn detail(
         Product,
         r#"
         SELECT id, ean, sku, title, description, summary, meta_title, meta_description,
-               slug, brand, locale, attributes, categories, unit_cost, price, stock,
+               slug, brand, locale, attributes, categories, unit_cost, price,
                status as "status: ProductStatus", created_at, updated_at
         FROM products
         WHERE id = $1
@@ -161,7 +161,7 @@ pub async fn update(
             updated_at = now()
         WHERE id = $1 AND status <> 'deleted'
         RETURNING id, ean, sku, title, description, summary, meta_title, meta_description,
-                  slug, brand, locale, attributes, categories, unit_cost, price, stock,
+                  slug, brand, locale, attributes, categories, unit_cost, price,
                   status as "status: ProductStatus", created_at, updated_at
         "#,
         id,

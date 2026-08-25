@@ -45,7 +45,6 @@ pub struct Product {
     /// `Decimal` e non `f64`: sono soldi. Vedi il commento nella migration.
     pub unit_cost: Option<Decimal>,
     pub price: Option<Decimal>,
-    pub stock: i32,
     pub status: ProductStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -64,7 +63,6 @@ pub struct ProductSummary {
     pub title: String,
     pub brand: Option<String>,
     pub price: Option<Decimal>,
-    pub stock: i32,
     pub status: ProductStatus,
     pub updated_at: DateTime<Utc>,
 }
