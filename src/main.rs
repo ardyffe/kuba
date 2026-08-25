@@ -6,10 +6,12 @@
 mod config;
 mod db;
 mod error;
+mod models;
 mod routes;
 mod state;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
@@ -36,12 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = db::connect(&config).await?;
     db::run_migrations(&db).await?;
 
+    // La cartella dei PDF viene creata all'avvio, non al primo upload: meglio
+    // scoprire adesso che il percorso non è scrivibile, non alle 2 di notte.
+    // `create_dir_all` è idempotente: se esiste già non fa nulla.
+    let invoices_dir = config.invoices_dir();
+    tokio::fs::create_dir_all(&invoices_dir).await?;
+    tracing::info!(dir = %invoices_dir.display(), "storage delle fatture pronto");
+
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
 
-    // `db` viene *spostata* dentro lo stato: da qui in poi il proprietario del
-    // pool è `state`, e usare ancora `db` sarebbe un errore di compilazione.
-    // È l'ownership di Rust: un valore ha un solo proprietario alla volta.
-    let state = AppState { db };
+    // `db` e `config` vengono *spostate* dentro lo stato: da qui in poi il
+    // proprietario è `state`, e usarle ancora sarebbe un errore di
+    // compilazione. È l'ownership di Rust: un valore, un proprietario.
+    let state = AppState {
+        db,
+        config: Arc::new(config),
+    };
 
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("in ascolto su http://{addr}");

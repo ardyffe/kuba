@@ -5,6 +5,7 @@
 //! messaggio chiaro, invece di scoprirlo alla prima richiesta HTTP.
 
 use std::env;
+use std::path::PathBuf;
 
 /// I parametri di cui il server ha bisogno per partire.
 ///
@@ -13,6 +14,8 @@ use std::env;
 pub struct Config {
     pub database_url: String,
     pub port: u16,
+    /// Radice dello storage su disco. Sotto ci finiscono i PDF delle fatture.
+    pub storage_dir: PathBuf,
 }
 
 /// Gli errori possibili durante il caricamento.
@@ -37,7 +40,38 @@ impl Config {
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             port: optional_port("PORT", 3000)?,
+            storage_dir: PathBuf::from(optional("STORAGE_DIR", "storage")),
         })
+    }
+
+    /// Dove finiscono i PDF delle fatture.
+    ///
+    /// Restituisce un `PathBuf` (posseduto) e non un `&Path` (prestato) perché
+    /// il percorso lo costruiamo qui sul momento: non esiste da nessuna parte
+    /// un valore a cui poter fare riferimento.
+    pub fn invoices_dir(&self) -> PathBuf {
+        self.storage_dir.join("invoices")
+    }
+
+    /// La *chiave* con cui il file è registrato nel database: `invoices/{id}.pdf`.
+    ///
+    /// È una chiave logica, non un percorso di sistema: sempre con `/`, sempre
+    /// relativa alla radice dello storage. Così il contenuto del database resta
+    /// valido se cambiamo `STORAGE_DIR`, se spostiamo il servizio su Linux o se
+    /// un domani passiamo a un object storage, dove questa diventerebbe la key.
+    ///
+    /// Il nome del file è l'UUID: mai il nome originale caricato dall'utente,
+    /// che potrebbe contenere `../` o caratteri validi solo su alcuni sistemi.
+    pub fn invoice_key(id: &uuid::Uuid) -> String {
+        format!("invoices/{id}.pdf")
+    }
+
+    /// Traduce una chiave logica nel percorso reale su questo sistema.
+    ///
+    /// `Path::join` gestisce da sé i separatori, quindi `invoices/x.pdf` su
+    /// Windows diventa un percorso valido senza conversioni manuali.
+    pub fn resolve(&self, key: &str) -> PathBuf {
+        self.storage_dir.join(key)
     }
 }
 
@@ -47,6 +81,13 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
     match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(ConfigError::Missing(name)),
+    }
+}
+
+fn optional(name: &'static str, default: &str) -> String {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => default.to_string(),
     }
 }
 

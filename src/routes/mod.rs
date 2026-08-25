@@ -1,12 +1,21 @@
 //! Composizione del router HTTP.
 
 mod health;
+mod invoices;
 
 use axum::Router;
-use axum::routing::get;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post};
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
+
+/// Tetto alla dimensione di un upload: 20 MB.
+///
+/// Axum di suo si ferma a 2 MB, che per un PDF con immagini è poco. Un limite
+/// però ci vuole: senza, una richiesta enorme potrebbe saturare la memoria del
+/// processo. Il limite viene applicato mentre il corpo arriva, non dopo.
+const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 /// Costruisce l'albero delle rotte.
 ///
@@ -16,8 +25,19 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health::health))
+        .route(
+            "/api/invoices",
+            // Stessa URL, due metodi HTTP diversi, due handler diversi.
+            post(invoices::upload).get(invoices::list),
+        )
+        // In axum 0.8 i segnaposto nei path si scrivono `{id}` (nelle versioni
+        // precedenti erano `:id`).
+        .route("/api/invoices/{id}", get(invoices::detail))
+        .route("/api/invoices/{id}/file", get(invoices::download))
+        // Il limite di dimensione vale per tutte le rotte qui sopra.
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         // Un layer è un middleware: qui logghiamo metodo, path, status e durata
-        // di ogni richiesta. Vale per tutte le rotte definite sopra.
+        // di ogni richiesta.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
