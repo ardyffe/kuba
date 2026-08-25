@@ -152,6 +152,63 @@ pub async fn detail(
     Ok(Json(invoice))
 }
 
+/// `POST /api/invoices/{id}/retry` — rimette in coda una fattura fallita.
+///
+/// Azzera i tentativi: è una decisione umana, non un ritentativo automatico.
+/// Chi preme il pulsante ha presumibilmente sistemato la causa del problema.
+///
+/// Il `WHERE status = 'failed'` fa da guardia: rimettere in coda una fattura
+/// già completata la rilavorerebbe da capo, e una `in_progress` finirebbe
+/// lavorata due volte in parallelo.
+pub async fn retry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<UploadAccepted>), AppError> {
+    let requeued = sqlx::query_scalar!(
+        r#"
+        UPDATE invoices
+        SET status = 'pending', attempts = 0, error_message = NULL,
+            next_attempt_at = NULL, started_at = NULL, finished_at = NULL
+        WHERE id = $1 AND status = 'failed'
+        RETURNING id
+        "#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    match requeued {
+        Some(id) => {
+            tracing::info!(%id, "fattura rimessa in coda");
+            // 202 come l'upload, e per lo stesso motivo: la fattura è in coda,
+            // il lavoro deve ancora avvenire.
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(UploadAccepted {
+                    id,
+                    status: InvoiceStatus::Pending,
+                }),
+            ))
+        }
+        // Niente riga aggiornata: o non esiste, o non è in stato `failed`.
+        // Distinguiamo i due casi, perché all'utente servono risposte diverse.
+        None => {
+            let current = sqlx::query_scalar!(
+                r#"SELECT status as "status: InvoiceStatus" FROM invoices WHERE id = $1"#,
+                id
+            )
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound("fattura"))?;
+
+            Err(AppError::Validation(format!(
+                "solo una fattura fallita può essere rimessa in coda (stato attuale: {})",
+                current.as_str()
+            )))
+        }
+    }
+}
+
 /// `GET /api/invoices/{id}/file` — restituisce il PDF originale.
 pub async fn download(
     State(state): State<AppState>,

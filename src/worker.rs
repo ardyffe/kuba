@@ -1,0 +1,331 @@
+//! Il worker: prende le fatture in coda e le lavora.
+//!
+//! # Perché la coda vive in Postgres
+//!
+//! L'alternativa ovvia sarebbe lanciare un task al momento dell'upload
+//! (`tokio::spawn` dentro l'handler). Funziona finché non succede niente: se il
+//! processo muore, o viene riavviato per un deploy, quel lavoro **sparisce** e
+//! nessuno sa che esisteva.
+//!
+//! Mettendo la coda in una tabella, invece, lo stato sopravvive al processo: al
+//! riavvio le fatture `pending` sono ancora lì. In più è lo stesso stato che il
+//! frontend mostra all'utente, quindi non c'è niente da tenere sincronizzato.
+//!
+//! # Il ciclo di vita
+//!
+//! ```text
+//!   upload ──► pending ──► in_progress ──┬──► succeeded
+//!                 ▲                      │
+//!                 └── (retry, backoff) ◄─┴──► failed ──► (POST /retry)
+//! ```
+
+use std::time::Duration;
+
+use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::state::AppState;
+
+/// Ogni quanto il worker torna a chiedere al database se c'è lavoro.
+///
+/// Due secondi sono un compromesso: abbastanza reattivo per un umano che
+/// guarda la pagina, abbastanza raro da non pesare. Da M7, con le notifiche
+/// `LISTEN/NOTIFY` di Postgres, il polling diventerà solo una rete di sicurezza.
+const IDLE_POLL: Duration = Duration::from_secs(2);
+
+/// Quanto aspettare se è il *database* a non rispondere: inutile martellarlo.
+const ERROR_POLL: Duration = Duration::from_secs(10);
+
+/// Dopo quanti tentativi una fattura viene dichiarata fallita.
+const MAX_ATTEMPTS: i32 = 3;
+
+/// Base del backoff esponenziale: 30s dopo il 1° errore, 60s dopo il 2°.
+const BACKOFF_BASE_SECS: u32 = 30;
+
+/// Una fattura presa in carico dal worker.
+struct Job {
+    id: Uuid,
+    original_filename: String,
+    storage_path: String,
+    attempts: i32,
+}
+
+/// Gli errori della lavorazione.
+///
+/// Sono separati da `AppError` di proposito: quelli sono errori *di una
+/// richiesta HTTP*, questi sono errori *di un lavoro in background*. Non hanno
+/// uno status code, hanno un messaggio che finisce nella colonna
+/// `error_message` e che l'utente leggerà nella pagina della fattura.
+#[derive(Debug, thiserror::Error)]
+enum JobError {
+    #[error("il file della fattura non è leggibile: {0}")]
+    FileUnreadable(String),
+
+    #[error("il file non è un PDF valido")]
+    NotAPdf,
+}
+
+/// Avvia il ciclo del worker. Ritorna quando arriva la cancellazione.
+///
+/// Questa funzione viene passata a `tokio::spawn` in `main.rs`, quindi gira su
+/// un task suo: l'API continua a rispondere mentre il worker lavora.
+pub async fn run(state: AppState, shutdown: CancellationToken) {
+    tracing::info!("worker avviato");
+
+    // Prima di tutto, rimettiamo in coda i lavori rimasti a metà.
+    if let Err(err) = requeue_stale(&state.db).await {
+        tracing::error!(error = %err, "impossibile recuperare i lavori interrotti");
+    }
+
+    while !shutdown.is_cancelled() {
+        let pause = match claim_next(&state.db).await {
+            Ok(Some(job)) => {
+                process(&state, job).await;
+                // C'era lavoro: riproviamo subito, potrebbe essercene altro.
+                Duration::ZERO
+            }
+            Ok(None) => IDLE_POLL,
+            Err(err) => {
+                tracing::error!(error = %err, "claim fallito");
+                ERROR_POLL
+            }
+        };
+
+        if pause.is_zero() {
+            continue;
+        }
+
+        // `select!` aspetta il primo dei due rami che si completa. Così
+        // l'attesa è interrompibile: allo spegnimento non restiamo fermi due
+        // secondi buoni prima di accorgercene.
+        //
+        // Nota dove *non* c'è un select: attorno a `process`. Un lavoro
+        // iniziato deve poter finire, altrimenti lo spegnimento lascerebbe una
+        // fattura bloccata in `in_progress`. La cancellazione si controlla fra
+        // un lavoro e l'altro, non dentro.
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+
+    tracing::info!("worker fermato");
+}
+
+/// Rimette in coda le fatture rimaste `in_progress` da un'esecuzione precedente.
+///
+/// Se il processo muore mentre lavora una fattura, quella riga resta
+/// `in_progress` per sempre: nessuno la riprenderà, perché il claim cerca solo
+/// le `pending`.
+///
+/// Questa versione assume **un solo worker attivo**: all'avvio, qualunque
+/// `in_progress` è per forza un residuo. Con più istanze in parallelo servirebbe
+/// distinguere "in lavorazione da qualcun altro adesso" da "abbandonata", e la
+/// soluzione standard è un lease: una colonna con la scadenza della presa in
+/// carico, che il worker rinnova mentre lavora.
+async fn requeue_stale(db: &PgPool) -> Result<(), sqlx::Error> {
+    let requeued = sqlx::query_scalar!(
+        r#"
+        UPDATE invoices
+        SET status = 'pending', started_at = NULL
+        WHERE status = 'in_progress'
+        RETURNING id
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    if !requeued.is_empty() {
+        tracing::warn!(count = requeued.len(), "lavori interrotti rimessi in coda");
+    }
+
+    Ok(())
+}
+
+/// Prende la prossima fattura da lavorare, se c'è.
+///
+/// # `FOR UPDATE SKIP LOCKED`
+///
+/// È la parte importante. `FOR UPDATE` blocca le righe selezionate fino a fine
+/// transazione; `SKIP LOCKED` dice "se una riga è già bloccata da qualcun altro,
+/// saltala invece di aspettare".
+///
+/// Insieme, sono ciò che rende sicuro avere più worker: due processi che fanno
+/// questa query nello stesso istante prendono due fatture **diverse**, senza
+/// lock espliciti e senza rischio che la stessa fattura venga lavorata due
+/// volte. È il database a fare da arbitro.
+///
+/// Il `WHERE` sul tempo implementa il backoff: una fattura che ha appena
+/// fallito ha `next_attempt_at` nel futuro e resta invisibile fino ad allora.
+async fn claim_next(db: &PgPool) -> Result<Option<Job>, sqlx::Error> {
+    let job = sqlx::query_as!(
+        Job,
+        r#"
+        WITH prossima AS (
+            SELECT id
+            FROM invoices
+            WHERE status = 'pending'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+            ORDER BY uploaded_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        UPDATE invoices
+        SET status = 'in_progress',
+            started_at = now(),
+            attempts = attempts + 1
+        FROM prossima
+        WHERE invoices.id = prossima.id
+        RETURNING invoices.id, invoices.original_filename,
+                  invoices.storage_path, invoices.attempts
+        "#
+    )
+    .fetch_optional(db)
+    .await?;
+
+    Ok(job)
+}
+
+/// Lavora una fattura e ne registra l'esito.
+///
+/// Non restituisce `Result` di proposito: qualunque cosa accada, lo stato della
+/// fattura **deve** essere scritto. Un errore che si propaga via `?` lascerebbe
+/// la riga in `in_progress` per sempre.
+async fn process(state: &AppState, job: Job) {
+    let id = job.id;
+    tracing::info!(%id, file = job.original_filename, attempt = job.attempts, "lavorazione avviata");
+
+    match run_pipeline(state, &job).await {
+        Ok(()) => {
+            if let Err(err) = mark_succeeded(&state.db, id).await {
+                tracing::error!(%id, error = %err, "impossibile segnare la fattura come completata");
+            } else {
+                tracing::info!(%id, "lavorazione completata");
+            }
+        }
+        Err(err) => {
+            let message = err.to_string();
+            // Un altro tentativo ha senso solo se ne restano.
+            let retry_in = (job.attempts < MAX_ATTEMPTS).then(|| backoff(job.attempts));
+
+            match retry_in {
+                Some(delay) => {
+                    tracing::warn!(%id, error = %message, attempt = job.attempts, retry_in_secs = delay, "lavorazione fallita, riprovo");
+                    if let Err(err) = schedule_retry(&state.db, id, &message, delay).await {
+                        tracing::error!(%id, error = %err, "impossibile programmare il nuovo tentativo");
+                    }
+                }
+                None => {
+                    tracing::error!(%id, error = %message, attempts = job.attempts, "lavorazione fallita definitivamente");
+                    if let Err(err) = mark_failed(&state.db, id, &message).await {
+                        tracing::error!(%id, error = %err, "impossibile segnare la fattura come fallita");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// La pipeline vera e propria.
+///
+/// Oggi fa solo i controlli reali che sappiamo già fare; i passi dell'agente
+/// arrivano in M4 e M5, e si innestano qui senza toccare niente di quanto sta
+/// sopra. È il senso di questa milestone: prima l'impalcatura, verificata, poi
+/// il contenuto.
+async fn run_pipeline(state: &AppState, job: &Job) -> Result<(), JobError> {
+    // 1. Il file esiste ed è leggibile?
+    let path = state.config.resolve(&job.storage_path);
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|err| JobError::FileUnreadable(err.to_string()))?;
+
+    // 2. È davvero un PDF? (già verificato all'upload, ma il file su disco
+    //    potrebbe essere stato toccato nel frattempo)
+    if !data.starts_with(b"%PDF-") {
+        return Err(JobError::NotAPdf);
+    }
+
+    tracing::debug!(id = %job.id, bytes = data.len(), "PDF letto");
+
+    // 3. Estrazione delle righe — M4.
+    simulate("estrazione delle righe").await;
+
+    // 4. Match sugli EAN già a catalogo — M5.
+    simulate("match sul catalogo").await;
+
+    // 5. Arricchimento e creazione delle schede — M5.
+    simulate("arricchimento e creazione prodotti").await;
+
+    Ok(())
+}
+
+/// Segnaposto per i passi non ancora implementati.
+async fn simulate(step: &str) {
+    tracing::debug!(step, "passo simulato (stub)");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Backoff esponenziale: 30s dopo il primo errore, 60s dopo il secondo.
+///
+/// Riprovare subito è quasi sempre inutile — se l'API remota è giù, lo è ancora
+/// un millisecondo dopo — e trasforma un guasto passeggero in un martellamento.
+fn backoff(attempts: i32) -> i64 {
+    let exponent = (attempts - 1).max(0) as u32;
+    i64::from(BACKOFF_BASE_SECS * 2u32.pow(exponent.min(10)))
+}
+
+async fn mark_succeeded(db: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        UPDATE invoices
+        SET status = 'succeeded', finished_at = now(), error_message = NULL,
+            next_attempt_at = NULL
+        WHERE id = $1
+        "#,
+        id
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn schedule_retry(
+    db: &PgPool,
+    id: Uuid,
+    message: &str,
+    delay_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        UPDATE invoices
+        SET status = 'pending',
+            started_at = NULL,
+            error_message = $2,
+            next_attempt_at = now() + make_interval(secs => $3)
+        WHERE id = $1
+        "#,
+        id,
+        message,
+        delay_secs as f64,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn mark_failed(db: &PgPool, id: Uuid, message: &str) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        UPDATE invoices
+        SET status = 'failed', finished_at = now(), error_message = $2,
+            next_attempt_at = NULL
+        WHERE id = $1
+        "#,
+        id,
+        message
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}

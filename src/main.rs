@@ -10,11 +10,13 @@ mod extract;
 mod models;
 mod routes;
 mod state;
+mod worker;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -56,13 +58,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config),
     };
 
+    // Il segnale di spegnimento, condiviso fra server HTTP e worker.
+    //
+    // Un `CancellationToken` è un interruttore che si può clonare e passare in
+    // giro: chiunque lo tenga può chiedere "è stato premuto?" oppure aspettare
+    // che lo sia. Clonarlo non crea interruttori diversi — puntano tutti allo
+    // stesso stato.
+    let shutdown = CancellationToken::new();
+
+    // Il worker gira su un task suo: `spawn` lo consegna al runtime, che lo
+    // esegue su uno qualunque dei thread del pool. Per questo il valore che gli
+    // passiamo deve essere `Send` (spostabile fra thread) e `'static` (non
+    // contenere prestiti da qui): il task può sopravvivere a questa funzione.
+    // È il motivo per cui `AppState` va clonato invece che prestato.
+    let worker = tokio::spawn(worker::run(state.clone(), shutdown.clone()));
+
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("in ascolto su http://{addr}");
 
     axum::serve(listener, routes::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown.clone()))
         .await?;
 
+    // Da qui in poi il server non accetta più richieste. Aspettiamo che il
+    // worker finisca il lavoro che ha in mano: senza questa attesa, il processo
+    // terminerebbe subito lasciando una fattura bloccata in `in_progress`.
+    tracing::info!("attendo che il worker finisca");
+    if let Err(err) = worker.await {
+        tracing::error!(%err, "il worker è terminato male");
+    }
+
+    tracing::info!("arrivederci");
     Ok(())
 }
 
@@ -81,14 +107,17 @@ fn init_tracing() {
         .init();
 }
 
-/// Attende Ctrl-C e lascia che axum chiuda le richieste in corso prima di
-/// spegnersi, invece di troncarle a metà.
+/// Attende Ctrl-C, poi avvisa tutti che si chiude.
 ///
-/// Ci servirà davvero da M3 in poi: quando ci sarà il worker, un'interruzione
-/// brutale potrebbe lasciare una fattura bloccata in stato `in_progress`.
-async fn shutdown_signal() {
+/// Questa funzione viene data ad axum come segnale di spegnimento: quando
+/// ritorna, il server smette di accettare richieste e completa quelle in corso.
+/// Prima di ritornare però preme l'interruttore condiviso, così anche il worker
+/// sa che deve fermarsi.
+async fn shutdown_signal(shutdown: CancellationToken) {
     match tokio::signal::ctrl_c().await {
         Ok(()) => tracing::info!("ricevuto Ctrl-C, spegnimento in corso"),
         Err(err) => tracing::error!(%err, "impossibile ascoltare Ctrl-C"),
     }
+
+    shutdown.cancel();
 }

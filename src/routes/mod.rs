@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         // precedenti erano `:id`).
         .route("/api/invoices/{id}", get(invoices::detail))
         .route("/api/invoices/{id}/file", get(invoices::download))
+        .route("/api/invoices/{id}/retry", post(invoices::retry))
         .route("/api/products", get(products::list))
         .route(
             "/api/products/{id}",

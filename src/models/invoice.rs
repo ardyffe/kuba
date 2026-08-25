@@ -29,6 +29,23 @@ pub enum InvoiceStatus {
     Failed,
 }
 
+impl InvoiceStatus {
+    /// Il nome dello stato così come appare nel database e nel JSON.
+    ///
+    /// Questo `match` è l'esempio più piccolo del vantaggio di cui sopra: il
+    /// giorno che aggiungi una variante, il compilatore si ferma **qui** e ti
+    /// obbliga a decidere come si chiama, invece di lasciarti scoprire a
+    /// runtime che stampa una stringa vuota.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Una fattura come la vede il client.
 ///
 /// Nota cosa **non** c'è: `storage_path`. Il percorso su disco è un dettaglio
