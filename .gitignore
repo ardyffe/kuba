@@ -1,4 +1,15 @@
+# Rust
+/target
+
+# Segreti: .env resta locale, .env.example va versionato
 .env
-.env.example
-target/
+
+# Frontend
 node_modules/
+
+# Artefatti di build finiti per errore nella root
+*.exe
+*.pdb
+
+# Fatture caricate a runtime (M1)
+/storage/
