@@ -1,0 +1,33 @@
+{
+  "_nota": "Verita' di riferimento trascritta a mano dal PDF Nordwind. Serve a misurare l'accuratezza dell'estrazione: si confronta con questo, non con l'output di un altro modello.",
+  "file": "invoice1.pdf",
+  "supplier_contains": "Nordwind",
+  "invoice_number": "2026100001",
+  "invoice_date": "2026-03-13",
+  "currency": "EUR",
+  "total_amount": "1858.50",
+  "_verifica": "La somma degli importi delle righe fa 1858.50, che coincide con il 'Total amount' stampato sul PDF: la trascrizione e' corretta.",
+  "lines": [
+    { "line_no": 1,  "ean": "6290360590868", "quantity": 6,  "unit_price": "8.10",  "amount": "48.60",  "kind": "product" },
+    { "line_no": 2,  "ean": "6290362340690", "quantity": 3,  "unit_price": "11.50", "amount": "34.50",  "kind": "product" },
+    { "line_no": 3,  "ean": "6291107459172", "quantity": 6,  "unit_price": "6.40",  "amount": "38.40",  "kind": "product" },
+    { "line_no": 4,  "ean": "6291108735596", "quantity": 6,  "unit_price": "10.90", "amount": "65.40",  "kind": "product" },
+    { "line_no": 5,  "ean": "6290360591490", "quantity": 4,  "unit_price": "13.50", "amount": "54.00",  "kind": "product" },
+    { "line_no": 6,  "ean": "6291108738191", "quantity": 4,  "unit_price": "18.00", "amount": "72.00",  "kind": "product" },
+    { "line_no": 7,  "ean": "6290362344094", "quantity": 6,  "unit_price": "8.25",  "amount": "49.50",  "kind": "product" },
+    { "line_no": 8,  "ean": "6290360595764", "quantity": 6,  "unit_price": "18.50", "amount": "111.00", "kind": "product" },
+    { "line_no": 9,  "ean": "6291108735541", "quantity": 12, "unit_price": "12.90", "amount": "154.80", "kind": "product" },
+    { "line_no": 10, "ean": "6290360598925", "quantity": 12, "unit_price": "18.00", "amount": "216.00", "kind": "product" },
+    { "line_no": 11, "ean": null,            "quantity": 6,  "unit_price": "3.70",  "amount": "22.20",  "kind": "product",
+      "_nota": "Como Moiselle 30 ml: sulla fattura NON ha item-no. L'EAN deve essere null, mai dedotto." },
+    { "line_no": 12, "ean": "6291108730089", "quantity": 12, "unit_price": "6.40",  "amount": "76.80",  "kind": "product" },
+    { "line_no": 13, "ean": "6290360598864", "quantity": 9,  "unit_price": "16.00", "amount": "144.00", "kind": "product" },
+    { "line_no": 14, "ean": "6290362346548", "quantity": 24, "unit_price": "12.95", "amount": "310.80", "kind": "product" },
+    { "line_no": 15, "ean": "6290362347132", "quantity": 9,  "unit_price": "19.50", "amount": "175.50", "kind": "product" },
+    { "line_no": 16, "ean": "6290360598963", "quantity": 6,  "unit_price": "12.50", "amount": "75.00",  "kind": "product" },
+    { "line_no": 17, "ean": "6291108737934", "quantity": 12, "unit_price": "8.50",  "amount": "102.00", "kind": "product" },
+    { "line_no": 18, "ean": "6291106063998", "quantity": 12, "unit_price": "9.00",  "amount": "108.00", "kind": "product" },
+    { "line_no": 19, "ean": null,            "quantity": 1,  "unit_price": "0.00",  "amount": "0.00",   "kind": "shipping",
+      "_nota": "Standard International: spedizione, non deve diventare una scheda prodotto." }
+  ]
+}

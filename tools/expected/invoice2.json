@@ -1,0 +1,28 @@
+{
+  "_nota": "Verita' di riferimento trascritta a mano dal PDF Vendora. Somma degli importi = 783.94, che coincide con il totale stampato: il conto torna, quindi la trascrizione e' corretta.",
+  "file": "invoice2.pdf",
+  "supplier_contains": "Vendora",
+  "invoice_number": "KXTR4ABZQ2",
+  "invoice_date": "2026-03-23",
+  "currency": "EUR",
+  "total_amount": "783.94",
+  "lines": [
+    { "line_no": 1,  "ean": "6290360590189", "quantity": 6,  "unit_price": "16.00", "amount": "96.00",  "kind": "product" },
+    { "line_no": 2,  "ean": "6290360593104", "quantity": 8,  "unit_price": "17.93", "amount": "143.44", "kind": "product" },
+    { "line_no": 3,  "ean": "6290362340829", "quantity": 6,  "unit_price": "7.90",  "amount": "47.40",  "kind": "product" },
+    { "line_no": 4,  "ean": "6290362348870", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 5,  "ean": "6290362348917", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 6,  "ean": "6290362348924", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 7,  "ean": "6290362348931", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 8,  "ean": "6290362348948", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 9,  "ean": "6290362348955", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 10, "ean": "6290362349006", "quantity": 12, "unit_price": "3.82",  "amount": "45.84",  "kind": "product" },
+    { "line_no": 11, "ean": "6291108735428", "quantity": 6,  "unit_price": "11.29", "amount": "67.74",  "kind": "product" },
+    { "line_no": 12, "ean": "6298043161084", "quantity": 12, "unit_price": "2.26",  "amount": "27.12",  "kind": "product" },
+    { "line_no": 13, "ean": "6298043161107", "quantity": 12, "unit_price": "2.26",  "amount": "27.12",  "kind": "product" },
+    { "line_no": 14, "ean": "6298043161114", "quantity": 12, "unit_price": "2.26",  "amount": "27.12",  "kind": "product" },
+    { "line_no": 15, "ean": "6298043161121", "quantity": 12, "unit_price": "2.26",  "amount": "27.12",  "kind": "product" },
+    { "line_no": 16, "ean": null,            "quantity": null, "unit_price": null,   "amount": "0.00",   "kind": "shipping",
+      "_nota": "Riga 'Shipping EUR 0.00' del riepilogo. Aggiunta dopo il primo giro: il modello l'aveva estratta e classificata correttamente, era il riferimento a essere incompleto." }
+  ]
+}

@@ -16,6 +16,8 @@ pub struct Config {
     pub port: u16,
     /// Radice dello storage su disco. Sotto ci finiscono i PDF delle fatture.
     pub storage_dir: PathBuf,
+    pub anthropic_api_key: String,
+    pub anthropic_model: String,
 }
 
 /// Gli errori possibili durante il caricamento.
@@ -41,6 +43,11 @@ impl Config {
             database_url: required("DATABASE_URL")?,
             port: optional_port("PORT", 3000)?,
             storage_dir: PathBuf::from(optional("STORAGE_DIR", "storage")),
+            // Obbligatoria: da M4 il worker non sa fare il suo mestiere senza.
+            // Meglio non partire affatto che partire e fallire ogni fattura.
+            anthropic_api_key: required("ANTHROPIC_API_KEY")?,
+            // Sovrascrivibile per provare un modello diverso senza ricompilare.
+            anthropic_model: optional("ANTHROPIC_MODEL", "claude-haiku-4-5"),
         })
     }
 

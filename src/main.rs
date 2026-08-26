@@ -3,6 +3,7 @@
 //! Questo file fa una cosa sola: mettere in piedi il servizio nell'ordine
 //! giusto e poi restare in ascolto.
 
+mod claude;
 mod config;
 mod db;
 mod error;
@@ -20,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::claude::ClaudeClient;
 use crate::config::Config;
 use crate::state::AppState;
 
@@ -50,12 +52,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
 
-    // `db` e `config` vengono *spostate* dentro lo stato: da qui in poi il
-    // proprietario è `state`, e usarle ancora sarebbe un errore di
+    let claude = ClaudeClient::new(
+        config.anthropic_api_key.clone(),
+        config.anthropic_model.clone(),
+    )?;
+    tracing::info!(model = config.anthropic_model, "client Claude pronto");
+
+    // `db`, `config` e `claude` vengono *spostate* dentro lo stato: da qui in
+    // poi il proprietario è `state`, e usarle ancora sarebbe un errore di
     // compilazione. È l'ownership di Rust: un valore, un proprietario.
     let state = AppState {
         db,
         config: Arc::new(config),
+        claude: Arc::new(claude),
     };
 
     // Il segnale di spegnimento, condiviso fra server HTTP e worker.

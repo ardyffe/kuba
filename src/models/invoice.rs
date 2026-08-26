@@ -1,6 +1,7 @@
 //! La fattura: il tipo Rust che corrisponde alla riga della tabella `invoices`.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -61,6 +62,8 @@ pub struct Invoice {
     pub supplier_name: Option<String>,
     pub invoice_number: Option<String>,
     pub invoice_date: Option<NaiveDate>,
+    pub currency: Option<String>,
+    pub total_amount: Option<Decimal>,
     pub status: InvoiceStatus,
     pub error_message: Option<String>,
     pub uploaded_at: DateTime<Utc>,

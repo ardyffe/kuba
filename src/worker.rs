@@ -21,10 +21,14 @@
 
 use std::time::Duration;
 
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::claude::{ClaudeError, ExtractedInvoice};
+use crate::models::line_item::LineItemKind;
 use crate::state::AppState;
 
 /// Ogni quanto il worker torna a chiedere al database se c'è lavoro.
@@ -64,6 +68,34 @@ enum JobError {
 
     #[error("il file non è un PDF valido")]
     NotAPdf,
+
+    #[error("estrazione fallita: {0}")]
+    Extraction(#[from] ClaudeError),
+
+    #[error("nessuna riga estratta dalla fattura")]
+    NothingExtracted,
+
+    #[error("errore del database: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl JobError {
+    /// Ha senso riprovare?
+    ///
+    /// Distinzione che prima non facevamo, e che ora conta: con l'API a
+    /// consumo, ritentare tre volte un errore che è per sua natura permanente
+    /// (chiave sbagliata, file cancellato) è tempo e denaro buttati.
+    fn is_retryable(&self) -> bool {
+        match self {
+            // Il file non ricomparirà da solo, e un PDF corrotto resta corrotto.
+            JobError::FileUnreadable(_) | JobError::NotAPdf => false,
+            // Qui decide il client: 429 e 5xx sì, 400 e 401 no.
+            JobError::Extraction(err) => err.is_retryable(),
+            // Può essere una risposta sfortunata: un tentativo in più è onesto.
+            JobError::NothingExtracted => true,
+            JobError::Database(_) => true,
+        }
+    }
 }
 
 /// Avvia il ciclo del worker. Ritorna quando arriva la cancellazione.
@@ -206,8 +238,10 @@ async fn process(state: &AppState, job: Job) {
         }
         Err(err) => {
             let message = err.to_string();
-            // Un altro tentativo ha senso solo se ne restano.
-            let retry_in = (job.attempts < MAX_ATTEMPTS).then(|| backoff(job.attempts));
+            // Un altro tentativo ha senso solo se ne restano **e** se l'errore
+            // è di quelli che possono andare diversamente.
+            let retry_in =
+                (job.attempts < MAX_ATTEMPTS && err.is_retryable()).then(|| backoff(job.attempts));
 
             match retry_in {
                 Some(delay) => {
@@ -248,13 +282,21 @@ async fn run_pipeline(state: &AppState, job: &Job) -> Result<(), JobError> {
 
     tracing::debug!(id = %job.id, bytes = data.len(), "PDF letto");
 
-    // 3. Estrazione delle righe — M4.
-    simulate("estrazione delle righe").await;
+    // 3. Estrazione delle righe: il PDF va al modello, torna JSON strutturato.
+    let extracted = state.claude.extract_invoice(&data).await?;
 
-    // 4. Match sugli EAN già a catalogo — M5.
+    if extracted.lines.is_empty() {
+        return Err(JobError::NothingExtracted);
+    }
+
+    // 4. Persistenza di testata e righe, in una transazione sola.
+    let saved = store_extraction(&state.db, job.id, &extracted).await?;
+    tracing::info!(id = %job.id, righe = saved, "righe salvate");
+
+    // 5. Match sugli EAN già a catalogo — M5.
     simulate("match sul catalogo").await;
 
-    // 5. Arricchimento e creazione delle schede — M5.
+    // 6. Arricchimento e creazione delle schede — M5.
     simulate("arricchimento e creazione prodotti").await;
 
     Ok(())
@@ -264,6 +306,122 @@ async fn run_pipeline(state: &AppState, job: &Job) -> Result<(), JobError> {
 async fn simulate(step: &str) {
     tracing::debug!(step, "passo simulato (stub)");
     tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Scrive testata e righe della fattura.
+///
+/// # Perché una transazione
+///
+/// Le due scritture sono una cosa sola dal punto di vista logico: una fattura
+/// con la testata aggiornata ma senza righe è uno stato che non deve esistere
+/// nemmeno per un istante. `BEGIN ... COMMIT` fa sì che chi legge veda o il
+/// prima o il dopo, mai il mezzo — e se qualcosa fallisce a metà, il database
+/// torna da solo al punto di partenza.
+///
+/// # Perché UPSERT e non INSERT
+///
+/// Al secondo tentativo della stessa fattura le righe verrebbero inserite di
+/// nuovo. `ON CONFLICT (invoice_id, line_no) DO UPDATE` fa sì che la riga 3
+/// resti la riga 3, aggiornata: l'estrazione diventa **idempotente**, si può
+/// ripetere quante volte si vuole senza sporcare i dati.
+async fn store_extraction(
+    db: &PgPool,
+    invoice_id: Uuid,
+    extracted: &ExtractedInvoice,
+) -> Result<usize, sqlx::Error> {
+    let mut tx = db.begin().await?;
+
+    sqlx::query!(
+        r#"
+        UPDATE invoices
+        SET supplier_name = $2, invoice_number = $3, invoice_date = $4,
+            currency = $5, total_amount = $6
+        WHERE id = $1
+        "#,
+        invoice_id,
+        extracted.supplier_name,
+        extracted.invoice_number,
+        parse_date(extracted.invoice_date.as_deref(), "invoice_date"),
+        extracted.currency,
+        parse_decimal(extracted.total_amount.as_deref(), "total_amount"),
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    for line in &extracted.lines {
+        sqlx::query!(
+            r#"
+            INSERT INTO invoice_line_items
+                (invoice_id, line_no, raw_text, description, ean, supplier_sku,
+                 quantity, unit_price, amount, kind)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (invoice_id, line_no) DO UPDATE SET
+                raw_text = EXCLUDED.raw_text,
+                description = EXCLUDED.description,
+                ean = EXCLUDED.ean,
+                supplier_sku = EXCLUDED.supplier_sku,
+                quantity = EXCLUDED.quantity,
+                unit_price = EXCLUDED.unit_price,
+                amount = EXCLUDED.amount,
+                kind = EXCLUDED.kind,
+                status = 'pending',
+                error_message = NULL
+            "#,
+            invoice_id,
+            line.line_no,
+            line.raw_text,
+            line.description,
+            line.ean,
+            line.supplier_sku,
+            line.quantity,
+            parse_decimal(line.unit_price.as_deref(), "unit_price"),
+            parse_decimal(line.amount.as_deref(), "amount"),
+            LineItemKind::parse(&line.kind) as LineItemKind,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Fino a qui niente è visibile agli altri. È questa riga a renderlo vero.
+    tx.commit().await?;
+
+    Ok(extracted.lines.len())
+}
+
+/// Converte un importo testuale in `Decimal`.
+///
+/// Un valore malformato **non** fa fallire l'estrazione: diventa `NULL` e
+/// lascia una riga nei log. Buttare via 39 righe corrette perché la 17ª ha un
+/// prezzo scritto male sarebbe un pessimo affare — e il campo `raw_text`
+/// conserva comunque l'originale per chi rivede.
+fn parse_decimal(raw: Option<&str>, field: &str) -> Option<Decimal> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match Decimal::from_str_exact(raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(field, raw, error = %err, "importo non interpretabile, salvo NULL");
+            None
+        }
+    }
+}
+
+fn parse_date(raw: Option<&str>, field: &str) -> Option<NaiveDate> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(field, raw, error = %err, "data non interpretabile, salvo NULL");
+            None
+        }
+    }
 }
 
 /// Backoff esponenziale: 30s dopo il primo errore, 60s dopo il secondo.

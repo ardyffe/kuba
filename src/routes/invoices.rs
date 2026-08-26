@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::invoice::{Invoice, InvoiceStatus};
+use crate::models::line_item::{InvoiceLineItem, LineItemAction, LineItemKind, LineItemStatus};
 use crate::state::AppState;
 
 /// I primi byte di ogni PDF valido. È il modo giusto di riconoscere un file:
@@ -117,7 +118,8 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<Invoice>>, A
         Invoice,
         r#"
         SELECT id, original_filename, size_bytes, sha256, supplier_name, invoice_number,
-               invoice_date, status as "status: InvoiceStatus", error_message, uploaded_at
+               invoice_date, currency, total_amount,
+               status as "status: InvoiceStatus", error_message, uploaded_at
         FROM invoices
         ORDER BY uploaded_at DESC
         "#
@@ -128,16 +130,30 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<Invoice>>, A
     Ok(Json(invoices))
 }
 
-/// `GET /api/invoices/{id}` — una fattura sola.
+/// La fattura con dentro le sue righe.
+///
+/// `#[serde(flatten)]` fonde i campi di `Invoice` al livello superiore del JSON,
+/// invece di annidarli sotto una chiave `invoice`. Il client vede un oggetto
+/// solo — `{ "id": ..., "status": ..., "lines": [...] }` — e la lista delle
+/// fatture e il dettaglio parlano la stessa lingua.
+#[derive(Serialize)]
+pub struct InvoiceDetail {
+    #[serde(flatten)]
+    invoice: Invoice,
+    lines: Vec<InvoiceLineItem>,
+}
+
+/// `GET /api/invoices/{id}` — una fattura con le sue righe estratte.
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Invoice>, AppError> {
+) -> Result<Json<InvoiceDetail>, AppError> {
     let invoice = sqlx::query_as!(
         Invoice,
         r#"
         SELECT id, original_filename, size_bytes, sha256, supplier_name, invoice_number,
-               invoice_date, status as "status: InvoiceStatus", error_message, uploaded_at
+               invoice_date, currency, total_amount,
+               status as "status: InvoiceStatus", error_message, uploaded_at
         FROM invoices
         WHERE id = $1
         "#,
@@ -149,7 +165,28 @@ pub async fn detail(
     // nel nostro 404. `ok_or` converte un Option in un Result, e il `?` fa il resto.
     .ok_or(AppError::NotFound("fattura"))?;
 
-    Ok(Json(invoice))
+    // Due query invece di una JOIN: la JOIN ripeterebbe i dati di testata su
+    // ogni riga e ci costringerebbe a ricomporli a mano. Con poche decine di
+    // righe per fattura, due andate al database sono più semplici e più chiare.
+    let lines = sqlx::query_as!(
+        InvoiceLineItem,
+        r#"
+        SELECT id, line_no, raw_text, description, ean, supplier_sku, quantity,
+               unit_price, amount,
+               kind as "kind: LineItemKind",
+               action as "action: LineItemAction",
+               status as "status: LineItemStatus",
+               matched_product_id, error_message
+        FROM invoice_line_items
+        WHERE invoice_id = $1
+        ORDER BY line_no
+        "#,
+        id
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(InvoiceDetail { invoice, lines }))
 }
 
 /// `POST /api/invoices/{id}/retry` — rimette in coda una fattura fallita.

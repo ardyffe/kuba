@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::claude::ClaudeClient;
 use crate::config::Config;
 
 /// Axum richiede che lo stato sia `Clone`: ne consegna una copia a ogni
@@ -18,8 +19,13 @@ use crate::config::Config;
 ///   "un solo dato in memoria, tanti proprietari condivisi, thread-safe".
 ///   Clonare un `Arc` significa incrementare un contatore atomico; quando
 ///   l'ultima copia sparisce, il dato viene liberato.
+/// - `ClaudeClient` contiene una `reqwest::Client`, cioè un pool di connessioni
+///   HTTPS: va costruita **una volta** e condivisa, altrimenti ogni chiamata
+///   rifarebbe l'handshake TLS da zero. Stesso ragionamento del pool Postgres,
+///   e stessa soluzione: un `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub config: Arc<Config>,
+    pub claude: Arc<ClaudeClient>,
 }
