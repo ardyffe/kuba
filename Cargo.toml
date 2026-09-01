@@ -8,6 +8,7 @@ axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 dotenvy = "0.15.7"
+futures = "0.3.34"
 hex = "0.4.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "charset"] }
 rust_decimal = { version = "1.42.1", features = ["serde"] }

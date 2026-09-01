@@ -55,8 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let claude = ClaudeClient::new(
         config.anthropic_api_key.clone(),
         config.anthropic_model.clone(),
+        config.anthropic_enrichment_model.clone(),
     )?;
-    tracing::info!(model = config.anthropic_model, "client Claude pronto");
+    tracing::info!(
+        estrazione = config.anthropic_model,
+        arricchimento = config.anthropic_enrichment_model,
+        "client Claude pronto"
+    );
 
     // `db`, `config` e `claude` vengono *spostate* dentro lo stato: da qui in
     // poi il proprietario è `state`, e usarle ancora sarebbe un errore di

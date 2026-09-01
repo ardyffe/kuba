@@ -18,6 +18,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     pub anthropic_api_key: String,
     pub anthropic_model: String,
+    pub anthropic_enrichment_model: String,
 }
 
 /// Gli errori possibili durante il caricamento.
@@ -48,6 +49,13 @@ impl Config {
             anthropic_api_key: required("ANTHROPIC_API_KEY")?,
             // Sovrascrivibile per provare un modello diverso senza ricompilare.
             anthropic_model: optional("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+            // L'arricchimento scrive il testo che finira' sul sito del cliente:
+            // e' il posto dove ha piu' senso pagare per un modello migliore.
+            // Se non specificato usa lo stesso dell'estrazione.
+            anthropic_enrichment_model: optional(
+                "ANTHROPIC_ENRICHMENT_MODEL",
+                &optional("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+            ),
         })
     }
 

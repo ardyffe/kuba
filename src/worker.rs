@@ -27,8 +27,11 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::claude::{ClaudeError, ExtractedInvoice};
-use crate::models::line_item::LineItemKind;
+use futures::StreamExt;
+
+use crate::claude::{ClaudeError, EnrichedProduct, ExtractedInvoice};
+use crate::models::line_item::{LineItemAction, LineItemKind, LineItemStatus};
+use crate::models::product::ProductStatus;
 use crate::state::AppState;
 
 /// Ogni quanto il worker torna a chiedere al database se c'è lavoro.
@@ -46,6 +49,13 @@ const MAX_ATTEMPTS: i32 = 3;
 
 /// Base del backoff esponenziale: 30s dopo il 1° errore, 60s dopo il 2°.
 const BACKOFF_BASE_SECS: u32 = 30;
+
+/// Quante schede prodotto si generano in parallelo.
+///
+/// Non è un numero preso a caso: ogni scheda sono ricerche web più una risposta
+/// lunga, e una fattura da 40 righe nuove lanciate tutte insieme prenderebbe un
+/// 429. Tre alla volta tengono occupata la rete senza esagerare.
+const ENRICH_CONCURRENCY: usize = 3;
 
 /// Una fattura presa in carico dal worker.
 struct Job {
@@ -293,19 +303,248 @@ async fn run_pipeline(state: &AppState, job: &Job) -> Result<(), JobError> {
     let saved = store_extraction(&state.db, job.id, &extracted).await?;
     tracing::info!(id = %job.id, righe = saved, "righe salvate");
 
-    // 5. Match sugli EAN già a catalogo — M5.
-    simulate("match sul catalogo").await;
+    // 5. Match sugli EAN già a catalogo: decide cosa fare di ogni riga.
+    let da_creare = match_lines(&state.db, job.id).await?;
+    tracing::info!(id = %job.id, da_creare = da_creare.len(), "match completato");
 
-    // 6. Arricchimento e creazione delle schede — M5.
-    simulate("arricchimento e creazione prodotti").await;
+    // 6. Arricchimento e creazione delle schede, per le sole righe nuove.
+    if !da_creare.is_empty() {
+        enrich_lines(state, da_creare).await;
+    }
 
     Ok(())
 }
 
-/// Segnaposto per i passi non ancora implementati.
-async fn simulate(step: &str) {
-    tracing::debug!(step, "passo simulato (stub)");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// Una riga per cui va creata la scheda prodotto.
+struct LineToEnrich {
+    id: Uuid,
+    description: String,
+    ean: Option<String>,
+    unit_price: Option<Decimal>,
+}
+
+/// Decide cosa fare di ogni riga della fattura, e restituisce quelle da creare.
+///
+/// # Le regole
+///
+/// | Riga | Azione | Perché |
+/// |---|---|---|
+/// | spedizione o sconto | `skip` | Non è un prodotto, non c'è niente da fare |
+/// | non classificabile | `needs_review` | Meglio un umano che un'ipotesi |
+/// | prodotto senza EAN | `needs_review` | Senza EAN non sappiamo se è già a catalogo |
+/// | EAN già a catalogo | `skip` | Esiste già; la giacenza non è di nostra competenza |
+/// | EAN a catalogo ma eliminato | `needs_review` | Qualcuno l'aveva tolto: ricrearlo in automatico ignorerebbe quella decisione |
+/// | EAN nuovo | `create` | Qui lavora l'agente |
+async fn match_lines(db: &PgPool, invoice_id: Uuid) -> Result<Vec<LineToEnrich>, sqlx::Error> {
+    let lines = sqlx::query!(
+        r#"
+        SELECT id, description, raw_text, ean, unit_price, kind as "kind: LineItemKind"
+        FROM invoice_line_items
+        WHERE invoice_id = $1
+        ORDER BY line_no
+        "#,
+        invoice_id
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut da_creare = Vec::new();
+
+    for line in lines {
+        // `motivo` accompagna le righe che finiscono in revisione: senza, chi
+        // apre la pagina vede "needs_review" e non sa perché.
+        let (action, status, matched, motivo) = match line.kind {
+            LineItemKind::Shipping | LineItemKind::Discount => {
+                (LineItemAction::Skip, LineItemStatus::Done, None, None)
+            }
+            LineItemKind::Unknown => (
+                LineItemAction::NeedsReview,
+                LineItemStatus::Matched,
+                None,
+                Some("riga non classificabile come prodotto".to_string()),
+            ),
+            LineItemKind::Product => match line.ean.as_deref() {
+                None => (
+                    LineItemAction::NeedsReview,
+                    LineItemStatus::Matched,
+                    None,
+                    Some("EAN non presente in fattura".to_string()),
+                ),
+                Some(ean) => {
+                    let existing = sqlx::query!(
+                        r#"SELECT id, status as "status: ProductStatus" FROM products WHERE ean = $1"#,
+                        ean
+                    )
+                    .fetch_optional(db)
+                    .await?;
+
+                    match existing {
+                        Some(p) if p.status == ProductStatus::Deleted => (
+                            LineItemAction::NeedsReview,
+                            LineItemStatus::Matched,
+                            Some(p.id),
+                            Some("prodotto già a catalogo ma eliminato".to_string()),
+                        ),
+                        Some(p) => (LineItemAction::Skip, LineItemStatus::Done, Some(p.id), None),
+                        None => (LineItemAction::Create, LineItemStatus::Matched, None, None),
+                    }
+                }
+            },
+        };
+
+        sqlx::query!(
+            r#"
+            UPDATE invoice_line_items
+            SET action = $2, status = $3, matched_product_id = $4, error_message = $5
+            WHERE id = $1
+            "#,
+            line.id,
+            action as LineItemAction,
+            status as LineItemStatus,
+            matched,
+            motivo,
+        )
+        .execute(db)
+        .await?;
+
+        if action == LineItemAction::Create {
+            da_creare.push(LineToEnrich {
+                id: line.id,
+                // La descrizione pulita se c'è, altrimenti il testo grezzo:
+                // meglio partire da qualcosa di sporco che non partire.
+                description: line.description.unwrap_or(line.raw_text),
+                ean: line.ean,
+                unit_price: line.unit_price,
+            });
+        }
+    }
+
+    Ok(da_creare)
+}
+
+/// Genera le schede e le scrive come bozze.
+///
+/// Non restituisce errore: una riga che fallisce non deve far fallire le altre
+/// 39, né l'intera fattura. Ogni riga porta il proprio esito.
+async fn enrich_lines(state: &AppState, lines: Vec<LineToEnrich>) {
+    // `buffer_unordered` è il pezzo interessante: costruisce uno stream di
+    // future e ne tiene N in volo contemporaneamente, avviandone una nuova
+    // appena una finisce. Non è un pool di thread — sono task asincroni sullo
+    // stesso runtime, in attesa di rete quasi tutto il tempo.
+    let esiti: Vec<_> = futures::stream::iter(lines)
+        .map(|line| {
+            // L'`Arc` si clona per ogni future: costa un contatore, e permette
+            // a ciascuna di possedere il proprio riferimento al client.
+            let claude = state.claude.clone();
+            async move {
+                let esito = claude
+                    .enrich_product(&line.description, line.ean.as_deref())
+                    .await;
+                (line, esito)
+            }
+        })
+        .buffer_unordered(ENRICH_CONCURRENCY)
+        .collect()
+        .await;
+
+    let (mut creati, mut falliti) = (0, 0);
+
+    for (line, esito) in esiti {
+        match esito {
+            Ok((product, _usage)) => match create_product(&state.db, &line, &product).await {
+                Ok(()) => creati += 1,
+                Err(err) => {
+                    tracing::error!(line = %line.id, error = %err, "scrittura della scheda fallita");
+                    mark_line_failed(&state.db, line.id, &err.to_string()).await;
+                    falliti += 1;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(line = %line.id, error = %err, "arricchimento fallito");
+                mark_line_failed(&state.db, line.id, &err.to_string()).await;
+                falliti += 1;
+            }
+        }
+    }
+
+    tracing::info!(creati, falliti, "schede prodotto generate");
+}
+
+/// Scrive la scheda come bozza e collega la riga di fattura.
+async fn create_product(
+    db: &PgPool,
+    line: &LineToEnrich,
+    product: &EnrichedProduct,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+
+    // `price` resta NULL di proposito: la fattura dà il costo d'acquisto, non
+    // il prezzo di vendita. Serve una regola di ricarico, e non la inventiamo.
+    let created = sqlx::query_scalar!(
+        r#"
+        INSERT INTO products
+            (ean, title, description, summary, meta_title, meta_description, slug, brand,
+             attributes, categories, unit_cost, status, source_line_item_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12)
+        ON CONFLICT (ean) DO NOTHING
+        RETURNING id
+        "#,
+        line.ean,
+        product.title,
+        product.description_html,
+        product.summary,
+        product.meta_title,
+        product.meta_description,
+        product.slug,
+        product.brand,
+        product.attributes(),
+        &product.categorie,
+        line.unit_price,
+        line.id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // Se lo stesso EAN è comparso due volte, la riga non è più da creare ma da
+    // saltare: è il database a dircelo, non lo indoviniamo noi.
+    let (action, product_id) = match created {
+        Some(id) => (LineItemAction::Create, Some(id)),
+        None => {
+            let existing = sqlx::query_scalar!("SELECT id FROM products WHERE ean = $1", line.ean)
+                .fetch_optional(&mut *tx)
+                .await?;
+            (LineItemAction::Skip, existing)
+        }
+    };
+
+    sqlx::query!(
+        r#"
+        UPDATE invoice_line_items
+        SET status = 'done', action = $2, matched_product_id = $3, error_message = NULL
+        WHERE id = $1
+        "#,
+        line.id,
+        action as LineItemAction,
+        product_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn mark_line_failed(db: &PgPool, line_id: Uuid, message: &str) {
+    if let Err(err) = sqlx::query!(
+        "UPDATE invoice_line_items SET status = 'failed', error_message = $2 WHERE id = $1",
+        line_id,
+        message,
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!(line = %line_id, error = %err, "impossibile registrare l'esito della riga");
+    }
 }
 
 /// Scrive testata e righe della fattura.
