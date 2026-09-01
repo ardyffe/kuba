@@ -498,7 +498,7 @@ async fn create_product(
         product.slug,
         product.brand,
         product.attributes(),
-        &product.categorie,
+        &product.categories(),
         line.unit_price,
         line.id,
     )

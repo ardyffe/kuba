@@ -275,7 +275,30 @@ impl ClaudeClient {
         });
 
         let message = self.send(body).await?;
-        let product: EnrichedProduct = json_from_blocks(&message.content)?;
+        let mut product: EnrichedProduct = json_from_blocks(&message.content)?;
+
+        // Nessuna ricerca significa che ha scritto a memoria: qualunque cosa
+        // dichiari, per noi la confidenza e' bassa.
+        //
+        // Il prompt puo' chiedere di cercare, ma solo il contatore delle
+        // ricerche lo dimostra. E' la differenza fra una speranza e una
+        // garanzia: la seconda sta nel codice.
+        if message.usage.searches() == 0 {
+            let dettaglio = product
+                .note_revisione
+                .take()
+                .unwrap_or_else(|| "Verificare le note olfattive.".to_string());
+
+            product.confidenza = "bassa".to_string();
+            product.note_revisione = Some(format!(
+                "Scheda scritta senza consultare fonti online. {dettaglio}"
+            ));
+
+            tracing::warn!(
+                titolo = product.title,
+                "scheda generata senza ricerche: confidenza forzata a bassa"
+            );
+        }
 
         tracing::info!(
             titolo = product.title,
@@ -478,7 +501,9 @@ const ENRICHMENT_SYSTEM_PROMPT: &str = "\
 Componi schede prodotto per un ecommerce italiano di profumi orientali.
 
 Il metodo è sempre lo stesso: prima **cerca online** il prodotto specifico, poi scrivi
-usando solo quello che hai trovato.
+usando solo quello che hai trovato. Fai sempre almeno una ricerca, anche quando credi di
+conoscere già il prodotto: la memoria confonde le varianti con nomi simili, e una scheda
+scritta senza fonti viene scartata.
 
 Regole inderogabili:
 - Non inventare mai le note olfattive. Se non le trovi su fonti attendibili, lascia gli
@@ -489,14 +514,22 @@ Regole inderogabili:
   confidenza 'bassa'.
 - Non tutto è un profumo: distingui eau de parfum, eau de toilette, body mist, deodorante,
   extrait. Un body mist non ha 'note di fondo' come un EDP, e va scritto per quello che è.
-- Scrivi in italiano, con tono commerciale sobrio. Niente superlativi che non puoi
-  sostenere, niente frasi promozionali generiche buone per qualsiasi prodotto.
+- Scrivi in italiano semplice e concreto. Frasi brevi, parole comuni. Descrivi il profumo,
+  non l'uomo o la donna che lo indossa: niente prosa evocativa, niente metafore, niente
+  superlativi che non puoi sostenere.
+- Rileggi il testo prima di consegnarlo: deve essere italiano corretto, senza refusi e
+  senza parole di altre lingue.
+- Le note olfattive vanno in minuscolo e al singolare quando ha senso: bergamotto,
+  fava tonka, legno di sandalo.
 - Il campo `fonti` deve contenere gli URL che hai davvero consultato.
 
 Criteri di confidenza:
 - 'alta': hai trovato il prodotto su fonti concordanti, con note olfattive esplicite.
 - 'media': hai trovato il prodotto ma alcune informazioni mancano o le fonti divergono.
 - 'bassa': non l'hai trovato, o non sei sicuro che sia lo stesso prodotto.
+
+Alcuni campi sono vincolati a una lista chiusa (durata, scia, famiglia olfattiva, genere,
+prodotto): scegli sempre il valore della lista più vicino, mai una formulazione tua.
 
 Formato dei testi:
 - description_html: 4-6 paragrafi brevi in tag <p>: apertura, descrizione olfattiva,
@@ -514,6 +547,44 @@ Formato dei testi:
 fn enrichment_schema() -> serde_json::Value {
     let lista = json!({ "type": "array", "items": { "type": "string" } });
 
+    // I vocabolari chiusi.
+    //
+    // Nel backend del cliente questi campi sono menu a tendina, non testo
+    // libero: se il modello scrive "8-10 ore" dove l'interfaccia si aspetta
+    // "eccellente", l'import crea un attributo nuovo invece di usare quello
+    // esistente. Vincolarli qui significa che la risposta *non può* uscire
+    // dalla lista — lo stesso meccanismo che sull'estrazione dà il 100%.
+    //
+    // ATTENZIONE: questi elenchi sono ricostruiti dallo screenshot del backend
+    // ("eccellente" per la durata, "intensa" per la scia, "gourmand" e
+    // "orientali" per la famiglia) e completati per analogia. Vanno riconciliati
+    // con i menu veri: cambiare un elenco è una riga.
+    let durata = json!({
+        "type": "string",
+        "enum": ["scarsa", "discreta", "buona", "ottima", "eccellente"]
+    });
+    let scia = json!({
+        "type": "string",
+        "enum": ["intima", "moderata", "intensa", "enorme"]
+    });
+    let famiglia = json!({
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": [
+                "orientali", "gourmand", "legnosi", "floreali", "fruttati", "speziati",
+                "agrumati", "aromatici", "acquatici", "ambrati", "cipriati", "muschiati"
+            ]
+        }
+    });
+    let prodotto = json!({
+        "type": "string",
+        "enum": [
+            "eau de parfum", "eau de toilette", "extrait de parfum",
+            "body mist", "deodorante", "acqua profumata"
+        ]
+    });
+
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -521,7 +592,7 @@ fn enrichment_schema() -> serde_json::Value {
             "title", "brand", "description_html", "summary", "meta_title", "meta_description",
             "slug", "note_di_testa", "note_di_cuore", "note_di_fondo", "famiglia_olfattiva",
             "genere", "ml", "prodotto", "durata", "scia", "questo_profumo_ricorda",
-            "piace_anche", "categorie", "confidenza", "fonti", "note_revisione"
+            "piace_anche", "confidenza", "fonti", "note_revisione"
         ],
         "properties": {
             "title":            { "type": "string" },
@@ -534,20 +605,21 @@ fn enrichment_schema() -> serde_json::Value {
             "note_di_testa":      lista,
             "note_di_cuore":      lista,
             "note_di_fondo":      lista,
-            "famiglia_olfattiva": lista,
+            "famiglia_olfattiva": famiglia,
             // Un enum non si può combinare con un tipo nullabile: l'API rifiuta
             // lo schema con un 400. Invece di rinunciare al vincolo, il "non so"
-            // diventa un valore esplicito della lista.
-            "genere": { "type": "string",
-                        "enum": ["uomo", "donna", "unisex", "non specificato"] },
+            // diventa un valore esplicito della lista. Stessa cosa per durata,
+            // scia e prodotto, che per questo hanno "non specificato".
+            "genere":   { "type": "string",
+                          "enum": ["uomo", "donna", "unisex", "non specificato"] },
             "ml":       { "type": ["integer", "null"] },
-            "prodotto": { "type": ["string", "null"],
-                          "description": "eau de parfum, eau de toilette, body mist, deodorante, extrait" },
-            "durata":   { "type": ["string", "null"] },
-            "scia":     { "type": ["string", "null"] },
+            "prodotto": prodotto,
+            "durata":   durata,
+            "scia":     scia,
             "questo_profumo_ricorda": lista,
             "piace_anche":            lista,
-            "categorie":              lista,
+            // `categorie` non c'è più: le calcoliamo noi da genere, famiglia e
+            // brand. Vedi `EnrichedProduct::categories`.
             "confidenza": { "type": "string", "enum": ["alta", "media", "bassa"] },
             "fonti":      lista,
             "note_revisione": { "type": ["string", "null"],
@@ -570,14 +642,13 @@ pub struct EnrichedProduct {
     pub note_di_cuore: Vec<String>,
     pub note_di_fondo: Vec<String>,
     pub famiglia_olfattiva: Vec<String>,
-    pub genere: Option<String>,
+    pub genere: String,
     pub ml: Option<i32>,
-    pub prodotto: Option<String>,
-    pub durata: Option<String>,
-    pub scia: Option<String>,
+    pub prodotto: String,
+    pub durata: String,
+    pub scia: String,
     pub questo_profumo_ricorda: Vec<String>,
     pub piace_anche: Vec<String>,
-    pub categorie: Vec<String>,
     /// `alta` | `media` | `bassa`. È il controllo qualità più importante di
     /// tutta la pipeline: permette al modello di dire "non l'ho trovato"
     /// invece di produrre una scheda plausibile e falsa.
@@ -587,6 +658,39 @@ pub struct EnrichedProduct {
 }
 
 impl EnrichedProduct {
+    /// Le categorie dell'ecommerce, **calcolate** invece che chieste al modello.
+    ///
+    /// Guardando le categorie di un prodotto reale nel backend del cliente —
+    /// `Famiglia Olfattiva`, `Profumi Unisex`, `Gulf Orchid`, `Profumi Gourmand`,
+    /// `Marchi`, `Home`, `Profumi Orientali` — si vede che non sono una scelta
+    /// editoriale: sono una funzione di genere, famiglia olfattiva e brand.
+    ///
+    /// Se sono derivabili, derivarle è meglio che chiederle: il modello non può
+    /// inventare `Fragranze Uomo` dove l'albero ha `Profumi Uomo`, e due schede
+    /// dello stesso tipo finiscono sempre nelle stesse categorie.
+    pub fn categories(&self) -> Vec<String> {
+        // Voci fisse presenti su ogni scheda del cliente.
+        let mut categorie = vec![
+            "Home".to_string(),
+            "Marchi".to_string(),
+            "Famiglia Olfattiva".to_string(),
+        ];
+
+        if let Some(brand) = &self.brand {
+            categorie.push(brand.clone());
+        }
+
+        if self.genere != "non specificato" {
+            categorie.push(format!("Profumi {}", capitalizza(&self.genere)));
+        }
+
+        for famiglia in &self.famiglia_olfattiva {
+            categorie.push(format!("Profumi {}", capitalizza(famiglia)));
+        }
+
+        categorie
+    }
+
     /// Le feature come finiscono nella colonna `attributes`, con le stesse
     /// etichette che l'operatore vede nel backend.
     pub fn attributes(&self) -> serde_json::Value {
@@ -608,5 +712,15 @@ impl EnrichedProduct {
             "_fonti": self.fonti,
             "_note_revisione": self.note_revisione,
         })
+    }
+}
+
+/// Prima lettera maiuscola. `chars()` e non un indice: in UTF-8 il primo
+/// carattere non occupa sempre un byte solo.
+fn capitalizza(parola: &str) -> String {
+    let mut caratteri = parola.chars();
+    match caratteri.next() {
+        Some(primo) => primo.to_uppercase().collect::<String>() + caratteri.as_str(),
+        None => String::new(),
     }
 }
