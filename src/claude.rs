@@ -100,6 +100,14 @@ pub struct ClaudeClient {
     /// sito del cliente, e la qualita' conta di piu'. Separato apposta, per
     /// poterlo alzare senza rendere piu' cara anche l'estrazione.
     enrichment_model: String,
+    /// Modello per la rilettura linguistica, se attiva.
+    ///
+    /// La divisione dei compiti nasce da una misura, non da un principio:
+    /// Haiku cerca bene e struttura bene, sbaglia solo l'italiano. Usare un
+    /// modello grande per l'intera generazione costa 5,6 volte tanto, perche'
+    /// il grosso della spesa sono i risultati di ricerca che entrano nel
+    /// contesto. Usarlo per rileggere ~1.200 token di testo costa quasi niente.
+    proofread_model: Option<String>,
 }
 
 impl ClaudeClient {
@@ -107,6 +115,7 @@ impl ClaudeClient {
         api_key: String,
         model: String,
         enrichment_model: String,
+        proofread_model: Option<String>,
     ) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -117,6 +126,7 @@ impl ClaudeClient {
             api_key,
             model,
             enrichment_model,
+            proofread_model,
         })
     }
 
@@ -311,6 +321,107 @@ impl ClaudeClient {
 
         Ok((product, message.usage))
     }
+}
+
+/// Corregge la lingua dei testi di una scheda, senza toccarne il contenuto.
+///
+/// Non fa ricerche e non vede i dati del prodotto: riceve solo il testo. E'
+/// questo che la rende quasi gratis anche con un modello grande — il costo
+/// dell'arricchimento sta nei risultati di ricerca, non nel modello.
+///
+/// Se `ANTHROPIC_PROOFREAD_MODEL` non e' impostata, non fa niente.
+impl ClaudeClient {
+    pub async fn proofread(
+        &self,
+        product: &mut EnrichedProduct,
+    ) -> Result<Option<Usage>, ClaudeError> {
+        let Some(model) = &self.proofread_model else {
+            return Ok(None);
+        };
+
+        let testi = json!({
+            "title": product.title,
+            "description_html": product.description_html,
+            "summary": product.summary,
+            "meta_title": product.meta_title,
+            "meta_description": product.meta_description,
+        });
+
+        let body = json!({
+            "model": model,
+            "max_tokens": MAX_TOKENS,
+            "system": PROOFREAD_SYSTEM_PROMPT,
+            "messages": [{
+                "role": "user",
+                "content": format!(
+                    "Correggi la lingua di questi testi e restituiscili nello stesso formato:\n\n{testi}"
+                )
+            }],
+            "output_config": {
+                "format": { "type": "json_schema", "schema": proofread_schema() }
+            }
+        });
+
+        let message = self.send(body).await?;
+        let corretti: ProofreadTexts = json_from_blocks(&message.content)?;
+
+        product.title = corretti.title;
+        product.description_html = corretti.description_html;
+        product.summary = corretti.summary;
+        product.meta_title = corretti.meta_title;
+        product.meta_description = corretti.meta_description;
+
+        tracing::info!(
+            input_token = message.usage.input_tokens,
+            output_token = message.usage.output_tokens,
+            "testi riletti"
+        );
+
+        Ok(Some(message.usage))
+    }
+}
+
+const PROOFREAD_SYSTEM_PROMPT: &str = "\
+Sei un revisore di italiano per schede prodotto di un ecommerce di profumi.
+
+Correggi **solo** la lingua:
+- refusi ed errori di ortografia (per esempio patciuli al posto di patchouli);
+- errori di grammatica, concordanza e costruzione;
+- parole di altre lingue lasciate per sbaglio nel testo italiano, sostituendole con
+  l equivalente italiano corrente. I nomi propri di profumi e marchi restano invariati,
+  cosi come i termini tecnici della profumeria che in italiano si usano tali e quali
+  (eau de parfum, extrait, sillage).
+
+Non fare nient altro:
+- non riscrivere le frasi che sono gia corrette;
+- non abbellire, non accorciare, non allungare;
+- non cambiare nessun dato di fatto: note olfattive, anni, nomi, formati restano come
+  sono, anche se ti sembrano sbagliati.
+
+Se un testo e gia corretto, restituiscilo identico.";
+
+fn proofread_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "description_html", "summary", "meta_title", "meta_description"],
+        "properties": {
+            "title":            { "type": "string" },
+            "description_html": { "type": "string" },
+            "summary":          { "type": ["string", "null"] },
+            "meta_title":       { "type": ["string", "null"] },
+            "meta_description": { "type": ["string", "null"] }
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ProofreadTexts {
+    title: String,
+    description_html: String,
+    summary: Option<String>,
+    meta_title: Option<String>,
+    meta_description: Option<String>,
 }
 
 /// Cerca il JSON conforme allo schema fra i blocchi della risposta.

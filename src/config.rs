@@ -19,6 +19,9 @@ pub struct Config {
     pub anthropic_api_key: String,
     pub anthropic_model: String,
     pub anthropic_enrichment_model: String,
+    /// Modello per la rilettura linguistica. `None` = passo disattivato: la
+    /// seconda chiamata non parte proprio, e non costa niente.
+    pub anthropic_proofread_model: Option<String>,
 }
 
 /// Gli errori possibili durante il caricamento.
@@ -56,6 +59,8 @@ impl Config {
                 "ANTHROPIC_ENRICHMENT_MODEL",
                 &optional("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             ),
+            // Nessun default: la rilettura si attiva solo se la chiedi.
+            anthropic_proofread_model: optional_opt("ANTHROPIC_PROOFREAD_MODEL"),
         })
     }
 
@@ -103,6 +108,14 @@ fn optional(name: &'static str, default: &str) -> String {
     match env::var(name) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => default.to_string(),
+    }
+}
+
+/// Come `optional`, ma l'assenza resta assenza invece di diventare un default.
+fn optional_opt(name: &'static str) -> Option<String> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
     }
 }
 

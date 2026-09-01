@@ -56,10 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.anthropic_api_key.clone(),
         config.anthropic_model.clone(),
         config.anthropic_enrichment_model.clone(),
+        config.anthropic_proofread_model.clone(),
     )?;
     tracing::info!(
         estrazione = config.anthropic_model,
         arricchimento = config.anthropic_enrichment_model,
+        rilettura = config
+            .anthropic_proofread_model
+            .as_deref()
+            .unwrap_or("disattivata"),
         "client Claude pronto"
     );
 

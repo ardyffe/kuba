@@ -437,9 +437,24 @@ async fn enrich_lines(state: &AppState, lines: Vec<LineToEnrich>) {
             // a ciascuna di possedere il proprio riferimento al client.
             let claude = state.claude.clone();
             async move {
-                let esito = claude
+                // Due passi: prima si compone la scheda cercando online, poi
+                // un modello piu' capace ne rilegge la lingua. La rilettura e'
+                // opzionale: senza ANTHROPIC_PROOFREAD_MODEL non parte.
+                let esito = match claude
                     .enrich_product(&line.description, line.ean.as_deref())
-                    .await;
+                    .await
+                {
+                    Ok((mut product, usage)) => match claude.proofread(&mut product).await {
+                        Ok(_) => Ok((product, usage)),
+                        // Se la rilettura fallisce teniamo la scheda com'e':
+                        // un testo con qualche refuso vale piu' di niente.
+                        Err(err) => {
+                            tracing::warn!(line = %line.id, error = %err, "rilettura fallita, tengo il testo originale");
+                            Ok((product, usage))
+                        }
+                    },
+                    Err(err) => Err(err),
+                };
                 (line, esito)
             }
         })
