@@ -7,6 +7,7 @@ mod products;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
@@ -48,5 +49,17 @@ pub fn router(state: AppState) -> Router {
         // Un layer è un middleware: qui logghiamo metodo, path, status e durata
         // di ogni richiesta.
         .layer(TraceLayer::new_for_http())
+        // Il frontend gira su un'altra porta (5173), quindi per il browser è
+        // un'altra origine e ogni chiamata sarebbe bloccata senza questo.
+        //
+        // Permissivo perché in sviluppo: prima di andare in produzione va
+        // ristretto all'origine vera del frontend. `Any` sull'origine esclude
+        // comunque l'invio di cookie e credenziali, che qui non usiamo.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
